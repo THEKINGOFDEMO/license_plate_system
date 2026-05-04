@@ -17,10 +17,16 @@ env/
 
 # Dataset and training artifacts
 datasets/
+lpr_data/
 weights/
 runs/
 media/
 outputs/
+*.pt
+*.pth
+*.onnx
+*.tar.xz
+*.zip
 
 # Frontend
 node_modules/
