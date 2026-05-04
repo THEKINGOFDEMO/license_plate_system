@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Build and logs
+*.log
+*.tmp
+*.bak
+
+# Dataset and training artifacts
+datasets/
+weights/
+runs/
+media/
+outputs/
+
+# Frontend
+node_modules/
+dist/
+
+# IDE and OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local database
+*.sqlite3
+
+# Coverage
+.coverage
+htmlcov/
+
+# Test scratch directories
+tests/_tmp_*/
