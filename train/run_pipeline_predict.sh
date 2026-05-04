@@ -14,6 +14,7 @@ OUTPUT_DIR="/cloud/cloud-ssd1/runs/pipeline/ccpd10000_yolo_crnn_predict"
 mkdir -p "/cloud/cloud-ssd1/runs/pipeline"
 
 cd "${PROJECT_ROOT}"
+export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
 
 python inference/license_plate_pipeline.py \
   --source "${SOURCE}" \

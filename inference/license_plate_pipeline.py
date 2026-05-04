@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
@@ -13,6 +14,11 @@ import cv2
 import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageFont
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 try:
     from train.crnn_dataset import CRNNCharset

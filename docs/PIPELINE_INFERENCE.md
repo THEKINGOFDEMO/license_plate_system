@@ -62,6 +62,28 @@ cd /cloud/cloud-ssd1/projects/license_plate_system
 pip install -r requirements.txt
 ```
 
+## 导入路径说明
+
+为避免直接运行脚本时出现：
+
+```text
+ModuleNotFoundError: No module named 'train'
+```
+
+当前项目已经同时做了两层处理：
+- `inference/license_plate_pipeline.py` 会自动把项目根目录加入 `sys.path`
+- `train/run_pipeline_predict.sh` 会显式导出 `PYTHONPATH`
+
+因此下面两种方式都应能正常运行：
+
+```bash
+python inference/license_plate_pipeline.py ...
+```
+
+```bash
+bash train/run_pipeline_predict.sh
+```
+
 ## 推理脚本
 
 主推理脚本：
@@ -143,10 +165,21 @@ predictions.csv
 - 如果一张图没有检测到车牌，也会写一行，`status=no_detection`
 - 如果识别或裁剪失败，也会保留错误状态和错误信息
 
+## 本次真实目录推理结果
+
+这次在 AutoDL 上对测试目录完成真实推理后，结果如下：
+- `total rows: 1000`
+- `status ok: 1000`
+- `no_detection: 0`
+- `plate_correct: 945`
+- `pipeline plate_accuracy: 0.945`
+- `pipeline char_accuracy: 0.9915714285714285`
+
+这些结果来自已完成的真实运行，不是估计值。
+
 ## 如何判断串联推理成功
 
 至少满足这些条件：
-
 1. 命令正常结束，没有报路径、依赖、CUDA 或权重加载错误。
 2. 输出目录下生成了：
    - `predictions.csv`
@@ -163,9 +196,9 @@ predictions.csv
 
 ## 当前建议
 
-完成这一步后，先人工抽查几张图片：
-- 检测框是否准确
-- 裁剪图是否完整包含车牌
-- 识别文本是否和图片一致
+当前串联推理已经能跑通，下一步如果继续做系统集成，建议优先复用：
+- `predictions.csv` 的字段结构
+- `annotated/` 的标注结果图
+- `crops/` 的车牌裁剪图
 
-如果目录推理结果稳定，再进入后续系统集成阶段。当前这一步先只完成算法推理流水线，不进入 Django/Vue。
+这一步先只完成算法推理流水线，不进入 Django/Vue。
