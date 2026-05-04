@@ -1,30 +1,22 @@
 # CRNN 训练说明
 
-## 文档目的
+## 文档范围
 
-本说明只覆盖 `Task 03`：CRNN 车牌字符识别模型训练准备。
-
-当前阶段只做：
-
-- CRNN 数据读取
-- 字符集说明
-- 模型结构说明
-- 诊断与调试
+这份文档只覆盖 CRNN 车牌字符识别训练相关内容，包括：
+- 数据格式
+- 字符集与 CTC 约定
 - smoke test
 - overfit test
 - 正式训练
-- 验证
-- 预测
-- 结果保存说明
+- 评估与预测
+- 训练输出与诊断文件
 
-当前阶段不做：
-
+这份文档不包含：
 - Django/Vue
 - 系统开发
 - YOLO+CRNN 串联推理
-- 论文正文撰写
 
-## CRNN 数据格式
+## 数据路径
 
 当前 CRNN 数据根目录：
 
@@ -33,126 +25,93 @@
 ```
 
 清单文件：
-
 - `/cloud/cloud-ssd1/lpr_data/ccpd_10000/crnn/train.txt`
 - `/cloud/cloud-ssd1/lpr_data/ccpd_10000/crnn/val.txt`
 - `/cloud/cloud-ssd1/lpr_data/ccpd_10000/crnn/test.txt`
 
 图像目录：
-
 - `/cloud/cloud-ssd1/lpr_data/ccpd_10000/crnn/images/train`
 - `/cloud/cloud-ssd1/lpr_data/ccpd_10000/crnn/images/val`
 - `/cloud/cloud-ssd1/lpr_data/ccpd_10000/crnn/images/test`
 
-每行格式类似：
+manifest 每行格式：
 
 ```text
 images/train/xxx.jpg    皖A12345
 ```
 
-读取规则：
+## 字符集与 CTC 约定
 
-- 使用相对路径相对于 `data-root` 解析图片位置；
-- 图像统一 resize 到 `height=32`、`width=160`；
-- 默认使用灰度输入；
-- 标签编码为 CTC Loss 可用格式；
-- 不做字符分割，直接学习整牌字符序列。
-
-## 字符集
-
-当前 CRNN 字符集覆盖 CCPD 常见字符类型：
-
-- 中文省份简称
-- 英文字母
-- 数字
-- `警`
-- `学`
-- `O`
-
-CTC blank 不作为真实字符，内部索引固定为 `0`。
-
-当前实现会根据 `train/val` manifest 中真实出现的字符动态构建字符集，并在训练输出目录中保存：
+当前实现会根据 `train/val/test` manifest 中真实出现的字符动态构建字符集，并保存到：
 
 ```text
 charset.json
 ```
 
-该文件包含：
+关键约定：
+- `blank_index = 0`
+- 真实字符索引从 `1` 开始
+- 模型输出类别数 `C = charset_size + 1`
+- 输入图像默认 resize 到 `32x160`
+- 默认使用灰度输入
+- CTC 解码采用标准 greedy decode：
+  - 逐时间步取 `argmax`
+  - 折叠连续重复 token
+  - 移除 blank
 
-- `blank_index`
-- `characters`
-- `char_to_index`
-- `index_to_char`
+## 诊断输出
 
-## 诊断与调试
-
-为便于定位 CTC 链路问题，训练脚本会额外输出并保存：
-
+训练启动时会在输出目录保存这些文件：
 - `charset.json`
 - `train_manifest_summary.json`
 - `val_manifest_summary.json`
+- `test_manifest_summary.json`
 - `dataset_debug_samples.json`
+- `debug_shapes.json`
 - `history.json`
 - `history.csv`
+- `train.log`
 
-训练开始前还会打印：
+其中 `debug_shapes.json` 会保存：
+- `image_tensor_shape`
+- `model_output_shape`
+- `T`
+- `num_classes`
+- `max_label_length`
+- `min_target_length`
+- `max_target_length`
+- `sample_input_lengths`
+- `sample_target_lengths`
+- `blank_index`
+- `charset_size`
+- `whether min_input_length >= max_target_length`
 
-- 字符集大小
-- 字符集字符列表
-- 最大标签长度、最小标签长度、平均标签长度
-- 10 条训练样本的图片路径、原始尺寸、resize 后尺寸、label、encoded label
-- `皖A12345` 的编码/解码回环结果
+训练开始时终端也会明确打印：
+- `Charset size`
+- `Max label length`
+- `Model output time steps T`
+- `Output classes C`
+- `input_lengths sample`
+- `target_lengths sample`
+- `Label roundtrip OK`
 
-如果提供 `test.txt`，脚本也会把 test 集纳入字符集覆盖检查，并额外保存：
-
-- `test_manifest_summary.json`
-
-## 模型结构
-
-当前实现使用标准 CRNN 思路：
-
-```text
-输入车牌裁剪图
-  -> CNN 特征提取
-  -> 序列特征重排
-  -> BiLSTM
-  -> BiLSTM
-  -> 全连接分类
-  -> CTC Loss
-```
-
-模型特点：
-
-- 使用 `CNN + BiLSTM + CTC Loss`
-- 输入为整张车牌裁剪图
-- 输出为完整车牌字符序列
-- 不做手动字符切分
+如果 `T < max_label_length`，训练脚本会直接报错停止。
 
 ## 依赖安装
 
-在 AutoDL 上先进入项目目录：
-
 ```bash
 cd /cloud/cloud-ssd1/projects/license_plate_system
-```
-
-安装依赖：
-
-```bash
 pip install -r requirements.txt
 ```
 
-## smoke test 命令
+## Smoke Test
 
-`1 epoch` smoke test 用于验证：
+作用：
+- 验证数据读取是否正常
+- 验证前向传播、CTC Loss、反向传播是否正常
+- 验证 checkpoint 是否能保存
 
-- 数据读取是否正常
-- 模型前向传播是否正常
-- CTC Loss 是否能计算
-- 反向传播是否正常
-- checkpoint 是否能保存
-
-执行命令：
+命令：
 
 ```bash
 cd /cloud/cloud-ssd1/projects/license_plate_system
@@ -165,21 +124,18 @@ bash train/run_crnn_smoke.sh
 /cloud/cloud-ssd1/runs/crnn/ccpd10000_crnn_smoke
 ```
 
-## overfit test 命令
+## Overfit Test
 
-在正式重训前，建议优先运行 overfit test：
+64 张样本 overfit：
 
 ```bash
 cd /cloud/cloud-ssd1/projects/license_plate_system
 bash train/run_crnn_overfit.sh
 ```
 
-该脚本会：
-
-- 只取 `64` 张训练图片；
-- 同时用这 `64` 张图片做 train/val；
-- 训练 `150` epochs；
-- 验证模型能否在极小样本上明显过拟合。
+用途：
+- 判断模型是否能在极小训练子集上学习到完整车牌
+- 辅助定位 CTC、标签、解码、结构是否仍有 bug
 
 输出目录：
 
@@ -187,22 +143,25 @@ bash train/run_crnn_overfit.sh
 /cloud/cloud-ssd1/runs/crnn/ccpd10000_crnn_overfit
 ```
 
-## tiny overfit test 命令
+## Tiny Overfit Test
 
-如果需要更强的链路验证，优先运行 tiny overfit：
+8 张样本 tiny overfit 是当前最强的链路验证。
+
+命令：
 
 ```bash
 cd /cloud/cloud-ssd1/projects/license_plate_system
 bash train/run_crnn_overfit_tiny.sh
 ```
 
-该脚本会：
-
-- 只取 `8` 张训练图片；
-- 同时用这 `8` 张图片做 train/val；
-- 训练 `300` epochs；
-- 每隔若干 epoch 输出这 8 张样本的 `gt/pred`；
-- 明确输出 `train_char_acc` 和 `train_plate_acc`。
+默认配置：
+- `epochs=1000`
+- `batch_size=8`
+- `lr=0.003`
+- `grad_clip=5.0`
+- `early_stop_train_plate_acc=1.0`
+- 每 `50` 个 epoch 打印完整 `8` 条 `gt/pred`
+- 训练和评估都只使用同一批 `8` 张训练样本
 
 输出目录：
 
@@ -210,18 +169,44 @@ bash train/run_crnn_overfit_tiny.sh
 /cloud/cloud-ssd1/runs/crnn/ccpd10000_crnn_overfit_tiny
 ```
 
-## 正式训练命令
+## Tiny Overfit 成功标准
 
-正式训练脚本默认配置：
+重点看训练集本身，不是 val：
+- `train_plate_acc` 明显上升，不能长期停在 `0`
+- 最理想情况是 `train_plate_acc` 接近或达到 `1.0`
+- `train.log` 末尾打印的 8 条最终样例中，大多数 `pred` 应与 `gt` 完全一致
+- `final_train_predictions.csv` 中 `exact_match` 的和应与终端打印的 `x/8` 一致
 
-- `epochs=50`
-- `batch_size=64`
-- `img_height=32`
-- `img_width=160`
-- `optimizer=Adam`
-- `loss=CTC Loss`
+如果 tiny overfit 仍失败，不要直接进入正式训练。
 
-执行命令：
+## final_train_predictions.csv
+
+当训练脚本启用了 `--eval-train-subset`，训练结束后会额外保存：
+
+```text
+final_train_predictions.csv
+```
+
+该文件至少包含：
+- `image_path`
+- `gt`
+- `pred`
+- `gt_len`
+- `pred_len`
+- `exact_match`
+- `edit_distance`
+
+另外会额外保存：
+- `char_match_count`
+- `char_total`
+
+指标复核方式：
+- `train_plate_acc = exact_match` 列的均值
+- `train_char_acc = sum(char_match_count) / sum(char_total)`
+
+## 正式训练
+
+命令：
 
 ```bash
 cd /cloud/cloud-ssd1/projects/license_plate_system
@@ -234,24 +219,26 @@ bash train/run_crnn_train.sh
 /cloud/cloud-ssd1/runs/crnn/ccpd10000_crnn
 ```
 
-## 验证命令
+建议只有在这些条件都满足后再进入正式训练：
+- smoke test 通过
+- tiny overfit 能明显记住 8 张样本
+- 64 张 overfit 也有明显提升
 
-训练完成后，使用 `best.pth` 进行验证：
+## 评估
+
+命令：
 
 ```bash
 cd /cloud/cloud-ssd1/projects/license_plate_system
 bash train/run_crnn_eval.sh
 ```
 
-验证脚本会输出：
-
+评估输出重点关注：
 - 字符准确率
 - 整牌准确率
-- 若干真实标签与预测结果样例
+- 若干 `gt/pred` 样例
 
-## 预测命令
-
-对单张图片或目录进行预测：
+## 预测
 
 目录预测脚本：
 
@@ -260,7 +247,7 @@ cd /cloud/cloud-ssd1/projects/license_plate_system
 bash train/run_crnn_predict.sh
 ```
 
-如果你想手动预测单张图，也可以执行：
+也可以单图预测：
 
 ```bash
 python train/predict_crnn.py \
@@ -269,87 +256,26 @@ python train/predict_crnn.py \
   --device cuda:0
 ```
 
-## 结果保存位置
+## 结果保存建议
 
-smoke test 输出目录：
-
-```text
-/cloud/cloud-ssd1/runs/crnn/ccpd10000_crnn_smoke
-```
-
-overfit test 输出目录：
-
-```text
-/cloud/cloud-ssd1/runs/crnn/ccpd10000_crnn_overfit
-```
-
-tiny overfit 输出目录：
-
-```text
-/cloud/cloud-ssd1/runs/crnn/ccpd10000_crnn_overfit_tiny
-```
-
-正式训练输出目录：
-
-```text
-/cloud/cloud-ssd1/runs/crnn/ccpd10000_crnn
-```
-
-训练完成后，重点关注：
-
+训练完成后建议保留：
 - `best.pth`
 - `last.pth`
 - `charset.json`
+- `debug_shapes.json`
 - `train_manifest_summary.json`
 - `val_manifest_summary.json`
 - `dataset_debug_samples.json`
 - `history.json`
 - `history.csv`
+- `train.log`
+- `final_train_predictions.csv`
 
-## 论文中需要保存哪些结果
+## 当前诊断建议
 
-建议论文与答辩阶段至少保留下列真实产物：
+如果 tiny overfit 在 `1000` epoch 后仍无法达到较高的 `train_plate_acc`，先不要直接正式训练。下一步优先考虑：
+- 更强的 CRNN 主干
+- 更稳的解码策略，例如 beam search
+- 固定 7 位车牌的多位置分类 baseline
 
-- `best.pth`
-- `last.pth`
-- `charset.json`
-- 训练日志
-- `history.json`
-- `history.csv`
-- 验证阶段输出的字符准确率
-- 验证阶段输出的整牌准确率
-- 若干真实标签与预测结果样例
-- 若干测试集预测样例
-
-建议论文中重点保留这些真实证据：
-
-- CRNN 模型结构说明
-- 训练配置说明
-- 字符准确率
-- 整牌准确率
-- 预测样例对比
-
-## 推荐执行顺序
-
-建议在 AutoDL 上按下面顺序执行：
-
-1. 安装依赖
-2. 运行 `bash train/run_crnn_overfit_tiny.sh`
-3. 确认 tiny overfit 能明显学住 8 张样本
-4. 再运行 `bash train/run_crnn_overfit.sh`
-5. 确认 64 张 overfit 也能明显提升 `train_plate_acc`
-6. 运行 `bash train/run_crnn_smoke.sh`
-7. 确认 smoke test 输出正常
-8. 运行 `bash train/run_crnn_train.sh`
-9. 运行 `bash train/run_crnn_eval.sh`
-10. 运行 `bash train/run_crnn_predict.sh`
-
-## 当前结论
-
-当前 `Task 03` 的目标是把 CRNN 训练准备、训练脚本、评估脚本、预测脚本和结果保留要求整理完整。
-
-这一步不包含：
-
-- Django/Vue
-- 系统开发
-- YOLO+CRNN 串联推理
+这一步先只作为诊断建议，不在当前任务里直接实现这些替代方案。

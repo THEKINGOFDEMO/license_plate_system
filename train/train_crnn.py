@@ -12,6 +12,7 @@ import torch
 from PIL import Image
 from torch import nn
 from torch.optim import Adam
+from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -20,7 +21,8 @@ try:
         CRNNDataset,
         CRNNCharset,
         build_charset_from_manifests,
-        compute_accuracy,
+        build_prediction_rows,
+        compute_accuracy_from_rows,
         crnn_collate_fn,
         decode_batch_predictions,
         save_debug_records,
@@ -33,7 +35,8 @@ except ImportError:
         CRNNDataset,
         CRNNCharset,
         build_charset_from_manifests,
-        compute_accuracy,
+        build_prediction_rows,
+        compute_accuracy_from_rows,
         crnn_collate_fn,
         decode_batch_predictions,
         save_debug_records,
@@ -89,6 +92,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help="Print gt/pred examples every N epochs.",
+    )
+    parser.add_argument(
+        "--early-stop-train-plate-acc",
+        type=float,
+        default=None,
+        help="Stop training early when train_plate_acc reaches this threshold.",
+    )
+    parser.add_argument(
+        "--grad-clip",
+        type=float,
+        default=0.0,
+        help="Optional gradient clipping max norm. Disabled when <= 0.",
     )
     parser.add_argument("--resume", default=None, help="Optional checkpoint path used to resume training.")
     return parser
@@ -162,7 +177,7 @@ def main() -> int:
     if args.debug_image_count > 0:
         save_debug_images(debug_records, output_dir / "debug_samples", args.debug_image_count, use_grayscale)
 
-    verify_label_roundtrip(charset, "皖A12345")
+    verify_label_roundtrip(charset, "\u7696A12345")
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -193,7 +208,7 @@ def main() -> int:
     ).to(device)
     criterion = nn.CTCLoss(blank=charset.blank_index, zero_infinity=True)
     optimizer = Adam(model.parameters(), lr=args.lr)
-    logger = build_logger(output_dir / "train.log")
+    log_path = output_dir / "train.log"
 
     history: List[Dict[str, float]] = []
     best_plate_accuracy = -1.0
@@ -206,11 +221,13 @@ def main() -> int:
         history = checkpoint.get("history", [])
         best_plate_accuracy = max((float(item["plate_accuracy"]) for item in history), default=-1.0)
         start_epoch = int(checkpoint["epoch"]) + 1
-        logger(f"[train_crnn] Resumed from checkpoint: {args.resume} at epoch {start_epoch}")
 
-    log_path = output_dir / "train.log"
     if start_epoch == 1 and log_path.exists():
         log_path.unlink()
+    logger = build_logger(log_path)
+    if args.resume:
+        logger(f"[train_crnn] Resumed from checkpoint: {args.resume} at epoch {start_epoch}")
+
     history_csv_path = output_dir / "history.csv"
     if not history_csv_path.exists() or start_epoch == 1:
         history_csv_path.write_text(
@@ -228,13 +245,21 @@ def main() -> int:
     save_debug_shapes(debug_shapes, output_dir / "debug_shapes.json")
     print_debug_shapes(logger, charset, max_label_length, model, debug_shapes)
 
+    stopped_early = False
     for epoch in range(start_epoch, args.epochs + 1):
-        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
+        train_loss = train_one_epoch(
+            model,
+            train_loader,
+            criterion,
+            optimizer,
+            device,
+            grad_clip=args.grad_clip,
+        )
         train_char_acc = 0.0
         train_plate_acc = 0.0
         train_samples: List[Tuple[str, str, str]] = []
         if args.eval_train_subset:
-            _, train_char_acc, train_plate_acc, train_samples = evaluate(
+            train_metrics = evaluate_detailed(
                 model,
                 train_eval_loader,
                 criterion,
@@ -242,8 +267,11 @@ def main() -> int:
                 charset,
                 sample_limit=args.sample_pred_count,
             )
+            train_char_acc = train_metrics["char_accuracy"]
+            train_plate_acc = train_metrics["plate_accuracy"]
+            train_samples = train_metrics["samples"]
 
-        val_loss, char_acc, plate_acc, samples = evaluate(
+        val_metrics = evaluate_detailed(
             model,
             val_loader,
             criterion,
@@ -251,6 +279,10 @@ def main() -> int:
             charset,
             sample_limit=args.sample_pred_count,
         )
+        val_loss = val_metrics["loss"]
+        char_acc = val_metrics["char_accuracy"]
+        plate_acc = val_metrics["plate_accuracy"]
+        samples = val_metrics["samples"]
         learning_rate = float(optimizer.param_groups[0]["lr"])
 
         epoch_record = {
@@ -300,7 +332,43 @@ def main() -> int:
             encoding="utf-8",
         )
 
+        if (
+            args.eval_train_subset
+            and args.early_stop_train_plate_acc is not None
+            and train_plate_acc >= args.early_stop_train_plate_acc
+        ):
+            logger(
+                "[train_crnn] Early stopping triggered: "
+                f"train_plate_acc={train_plate_acc:.4f} reached threshold={args.early_stop_train_plate_acc:.4f}"
+            )
+            stopped_early = True
+            break
+
+    if args.eval_train_subset:
+        final_train_metrics = evaluate_detailed(
+            model,
+            train_eval_loader,
+            criterion,
+            device,
+            charset,
+            sample_limit=max(args.sample_pred_count, 8),
+        )
+        final_train_csv_path = output_dir / "final_train_predictions.csv"
+        save_prediction_rows_csv(final_train_metrics["prediction_rows"], final_train_csv_path)
+        final_exact_matches = sum(int(row["exact_match"]) for row in final_train_metrics["prediction_rows"])
+        final_total = len(final_train_metrics["prediction_rows"])
+        logger(
+            "[train_crnn] Final train metrics: "
+            f"train_char_acc={final_train_metrics['char_accuracy']:.4f} "
+            f"train_plate_acc={final_train_metrics['plate_accuracy']:.4f} "
+            f"exact_match={final_exact_matches}/{final_total}"
+        )
+        print_sample_predictions(logger, "train-final", final_train_metrics["samples"])
+        logger(f"[train_crnn] Final train prediction CSV: {final_train_csv_path}")
+
     logger(f"[train_crnn] Best plate accuracy: {best_plate_accuracy:.4f}")
+    if stopped_early:
+        logger("[train_crnn] Training finished via early stopping.")
     logger(f"[train_crnn] Outputs saved to: {output_dir}")
     return 0
 
@@ -311,6 +379,7 @@ def train_one_epoch(
     criterion: nn.CTCLoss,
     optimizer: Adam,
     device: torch.device,
+    grad_clip: float = 0.0,
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -341,6 +410,8 @@ def train_one_epoch(
 
         loss = criterion(log_probs, targets, input_lengths, target_lengths)
         loss.backward()
+        if grad_clip > 0:
+            clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
         total_loss += loss.item()
 
@@ -348,25 +419,26 @@ def train_one_epoch(
 
 
 @torch.no_grad()
-def evaluate(
+def evaluate_detailed(
     model: CRNN,
     data_loader: DataLoader,
     criterion: nn.CTCLoss,
     device: torch.device,
     charset: CRNNCharset,
     sample_limit: int,
-) -> Tuple[float, float, float, List[Tuple[str, str, str]]]:
+) -> Dict[str, object]:
     model.eval()
     total_loss = 0.0
     all_predictions: List[str] = []
     all_targets: List[str] = []
-    sample_outputs: List[Tuple[str, str, str]] = []
+    all_image_paths: List[str] = []
 
     for batch_index, batch in enumerate(tqdm(data_loader, desc="eval", leave=False), start=1):
         images = batch["images"].to(device)
         targets = batch["targets"].to(device)
         target_lengths = batch["target_lengths"].to(device)
         texts = batch["texts"]
+        image_paths = batch["image_paths"]
         image_rel_paths = batch["image_rel_paths"]
 
         logits = model(images)
@@ -393,13 +465,25 @@ def evaluate(
         predictions = decode_batch_predictions(logits, charset)
         all_predictions.extend(predictions)
         all_targets.extend(texts)
+        all_image_paths.extend([str(path) for path in image_paths])
 
-        for rel_path, target_text, pred_text in zip(image_rel_paths, texts, predictions):
-            if len(sample_outputs) < sample_limit:
-                sample_outputs.append((str(rel_path), str(target_text), str(pred_text)))
-
-    char_acc, plate_acc = compute_accuracy(all_predictions, all_targets)
-    return total_loss / max(len(data_loader), 1), char_acc, plate_acc, sample_outputs
+    prediction_rows = build_prediction_rows(
+        image_paths=all_image_paths,
+        predictions=all_predictions,
+        targets=all_targets,
+    )
+    char_acc, plate_acc = compute_accuracy_from_rows(prediction_rows)
+    sample_outputs = [
+        (str(row["image_path"]), str(row["gt"]), str(row["pred"]))
+        for row in prediction_rows[:sample_limit]
+    ]
+    return {
+        "loss": total_loss / max(len(data_loader), 1),
+        "char_accuracy": char_acc,
+        "plate_accuracy": plate_acc,
+        "samples": sample_outputs,
+        "prediction_rows": prediction_rows,
+    }
 
 
 def validate_ctc_lengths(
@@ -494,6 +578,27 @@ def print_sample_predictions(logger, tag: str, samples: List[Tuple[str, str, str
     logger(f"[train_crnn] Sample predictions ({tag}):")
     for rel_path, target_text, pred_text in samples:
         logger(f"  - {rel_path}: gt={target_text} pred={pred_text}")
+
+
+def save_prediction_rows_csv(prediction_rows: Sequence[Dict[str, object]], output_path: Path) -> None:
+    with output_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "image_path",
+                "gt",
+                "pred",
+                "gt_len",
+                "pred_len",
+                "exact_match",
+                "edit_distance",
+                "char_match_count",
+                "char_total",
+            ],
+        )
+        writer.writeheader()
+        for row in prediction_rows:
+            writer.writerow(row)
 
 
 def collect_debug_shapes(

@@ -19,9 +19,9 @@ python train/train_crnn.py \
   --train-file "${TRAIN_FILE}" \
   --val-file "${TRAIN_FILE}" \
   --test-file "${TEST_FILE}" \
-  --epochs 300 \
+  --epochs 1000 \
   --batch-size 8 \
-  --lr 0.001 \
+  --lr 0.003 \
   --output-dir "${OUTPUT_DIR}" \
   --device cuda:0 \
   --img-height 32 \
@@ -32,5 +32,7 @@ python train/train_crnn.py \
   --debug-sample-count 8 \
   --debug-image-count 8 \
   --eval-train-subset \
+  --early-stop-train-plate-acc 1.0 \
+  --grad-clip 5.0 \
   --sample-pred-count 8 \
-  --sample-pred-interval 10
+  --sample-pred-interval 50

@@ -142,18 +142,23 @@ class CRNNCharset:
         return "".join(decoded)
 
     def decode_indices(self, indices: Sequence[int], collapse_repeats: bool = True) -> str:
+        sequence = list(indices)
+        if collapse_repeats:
+            collapsed: List[int] = []
+            previous: Optional[int] = None
+            for index in sequence:
+                if previous is None or index != previous:
+                    collapsed.append(index)
+                previous = index
+            sequence = collapsed
+
         decoded: List[str] = []
-        previous: Optional[int] = None
-        for index in indices:
+        for index in sequence:
             if index == self.blank_index:
-                previous = None
                 continue
             if index not in self.index_to_char:
                 raise ValueError(f"Predicted index {index} is outside the charset mapping.")
-            if collapse_repeats and previous == index:
-                continue
             decoded.append(self.index_to_char[index])
-            previous = index
         return "".join(decoded)
 
     def to_json_dict(self) -> Dict[str, object]:
@@ -373,22 +378,89 @@ def decode_batch_predictions(logits: torch.Tensor, charset: CRNNCharset) -> List
 def compute_accuracy(predictions: Sequence[str], targets: Sequence[str]) -> Tuple[float, float]:
     """Return character accuracy and whole-plate accuracy."""
 
-    total_chars = 0
+    rows = build_prediction_rows(
+        image_paths=[f"sample_{index}" for index in range(len(targets))],
+        predictions=predictions,
+        targets=targets,
+    )
+    return compute_accuracy_from_rows(rows)
+
+
+def normalize_plate_text(text: str) -> str:
+    return str(text).strip()
+
+
+def compute_edit_distance(source: str, target: str) -> int:
+    source = normalize_plate_text(source)
+    target = normalize_plate_text(target)
+
+    if source == target:
+        return 0
+    if not source:
+        return len(target)
+    if not target:
+        return len(source)
+
+    previous = list(range(len(target) + 1))
+    for source_index, source_char in enumerate(source, start=1):
+        current = [source_index]
+        for target_index, target_char in enumerate(target, start=1):
+            substitution_cost = 0 if source_char == target_char else 1
+            current.append(
+                min(
+                    previous[target_index] + 1,
+                    current[target_index - 1] + 1,
+                    previous[target_index - 1] + substitution_cost,
+                )
+            )
+        previous = current
+    return previous[-1]
+
+
+def compute_char_match_count(prediction: str, target: str) -> int:
+    normalized_prediction = normalize_plate_text(prediction)
+    normalized_target = normalize_plate_text(target)
+
     correct_chars = 0
-    correct_plates = 0
+    for index, target_char in enumerate(normalized_target):
+        pred_char = normalized_prediction[index] if index < len(normalized_prediction) else None
+        if pred_char == target_char:
+            correct_chars += 1
+    return correct_chars
 
-    for prediction, target in zip(predictions, targets):
-        if prediction == target:
-            correct_plates += 1
 
-        total_chars += len(target)
-        for index, target_char in enumerate(target):
-            pred_char = prediction[index] if index < len(prediction) else None
-            if pred_char == target_char:
-                correct_chars += 1
+def build_prediction_rows(
+    image_paths: Sequence[str],
+    predictions: Sequence[str],
+    targets: Sequence[str],
+) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    for image_path, prediction, target in zip(image_paths, predictions, targets):
+        normalized_prediction = normalize_plate_text(prediction)
+        normalized_target = normalize_plate_text(target)
+        char_match_count = compute_char_match_count(normalized_prediction, normalized_target)
+        rows.append(
+            {
+                "image_path": str(image_path).strip(),
+                "gt": normalized_target,
+                "pred": normalized_prediction,
+                "gt_len": len(normalized_target),
+                "pred_len": len(normalized_prediction),
+                "exact_match": 1 if normalized_prediction == normalized_target else 0,
+                "edit_distance": compute_edit_distance(normalized_prediction, normalized_target),
+                "char_match_count": char_match_count,
+                "char_total": len(normalized_target),
+            }
+        )
+    return rows
 
+
+def compute_accuracy_from_rows(rows: Sequence[Dict[str, object]]) -> Tuple[float, float]:
+    total_chars = sum(int(row["char_total"]) for row in rows)
+    correct_chars = sum(int(row["char_match_count"]) for row in rows)
+    correct_plates = sum(int(row["exact_match"]) for row in rows)
     char_accuracy = correct_chars / total_chars if total_chars else 0.0
-    plate_accuracy = correct_plates / len(targets) if targets else 0.0
+    plate_accuracy = correct_plates / len(rows) if rows else 0.0
     return char_accuracy, plate_accuracy
 
 
