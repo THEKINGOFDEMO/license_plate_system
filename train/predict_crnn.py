@@ -35,6 +35,7 @@ def main() -> int:
 
     model = CRNN(
         img_height=int(checkpoint["img_height"]),
+        img_width=int(checkpoint["img_width"]),
         num_channels=1 if bool(checkpoint["grayscale"]) else 3,
         num_classes=charset.num_classes,
     ).to(device)

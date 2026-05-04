@@ -60,6 +60,7 @@ def main() -> int:
 
     model = CRNN(
         img_height=int(checkpoint["img_height"]),
+        img_width=int(checkpoint["img_width"]),
         num_channels=1 if bool(checkpoint["grayscale"]) else 3,
         num_classes=charset.num_classes,
     ).to(device)
@@ -77,6 +78,7 @@ def main() -> int:
 
     print(f"[eval_crnn] checkpoint={args.checkpoint}")
     print(f"[eval_crnn] manifest={args.manifest_file}")
+    print(f"[eval_crnn] output_time_steps={checkpoint.get('output_time_steps', 'unknown')}")
     print(f"[eval_crnn] loss={val_loss:.4f}")
     print(f"[eval_crnn] char_accuracy={char_acc:.4f}")
     print(f"[eval_crnn] plate_accuracy={plate_acc:.4f}")

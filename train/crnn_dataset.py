@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+import random
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -91,6 +93,17 @@ class SampleRecord:
     label_text: str
 
 
+@dataclass
+class ManifestSummary:
+    manifest_path: str
+    num_samples: int
+    unique_characters: List[str]
+    charset_size: int
+    max_label_length: int
+    min_label_length: int
+    avg_label_length: float
+
+
 class CRNNCharset:
     """Character encoder/decoder for CCPD plate text."""
 
@@ -98,6 +111,9 @@ class CRNNCharset:
         chars = list(characters or DEFAULT_CHARSET)
         if len(chars) != len(set(chars)):
             raise ValueError("Charset contains duplicate characters.")
+        if "" in chars:
+            raise ValueError("Charset cannot contain an empty character.")
+
         self.blank_index = 0
         self.characters = chars
         self.index_to_char: Dict[int, str] = {index + 1: char for index, char in enumerate(chars)}
@@ -115,18 +131,43 @@ class CRNNCharset:
             encoded.append(self.char_to_index[char])
         return encoded
 
+    def decode_encoded_text(self, encoded: Sequence[int]) -> str:
+        decoded: List[str] = []
+        for index in encoded:
+            if index == self.blank_index:
+                raise ValueError("Blank index cannot appear in an encoded ground-truth label.")
+            if index not in self.index_to_char:
+                raise ValueError(f"Encoded label index {index} is outside the charset mapping.")
+            decoded.append(self.index_to_char[index])
+        return "".join(decoded)
+
     def decode_indices(self, indices: Sequence[int], collapse_repeats: bool = True) -> str:
         decoded: List[str] = []
-        previous = None
+        previous: Optional[int] = None
         for index in indices:
             if index == self.blank_index:
                 previous = None
                 continue
+            if index not in self.index_to_char:
+                raise ValueError(f"Predicted index {index} is outside the charset mapping.")
             if collapse_repeats and previous == index:
                 continue
             decoded.append(self.index_to_char[index])
             previous = index
         return "".join(decoded)
+
+    def to_json_dict(self) -> Dict[str, object]:
+        return {
+            "blank_index": self.blank_index,
+            "num_classes": self.num_classes,
+            "characters": self.characters,
+            "char_to_index": self.char_to_index,
+            "index_to_char": {str(index): char for index, char in self.index_to_char.items()},
+        }
+
+    def save_json(self, output_path: str | Path) -> None:
+        path = Path(output_path)
+        path.write_text(json.dumps(self.to_json_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def load_manifest(data_root: str | Path, manifest_path: str | Path) -> List[SampleRecord]:
@@ -165,6 +206,47 @@ def load_manifest(data_root: str | Path, manifest_path: str | Path) -> List[Samp
     return records
 
 
+def build_charset_from_records(records: Sequence[SampleRecord], fallback_charset: Optional[Sequence[str]] = None) -> CRNNCharset:
+    fallback = list(fallback_charset or DEFAULT_CHARSET)
+    fallback_set = set(fallback)
+
+    ordered_chars: List[str] = []
+    present_chars = {char for record in records for char in record.label_text}
+
+    for char in fallback:
+        if char in present_chars:
+            ordered_chars.append(char)
+
+    missing = sorted(present_chars - fallback_set)
+    ordered_chars.extend(missing)
+    return CRNNCharset(ordered_chars)
+
+
+def build_charset_from_manifests(
+    data_root: str | Path,
+    manifest_paths: Sequence[str | Path],
+    fallback_charset: Optional[Sequence[str]] = None,
+) -> CRNNCharset:
+    records: List[SampleRecord] = []
+    for manifest_path in manifest_paths:
+        records.extend(load_manifest(data_root=data_root, manifest_path=manifest_path))
+    return build_charset_from_records(records=records, fallback_charset=fallback_charset)
+
+
+def summarize_manifest(records: Sequence[SampleRecord], manifest_path: str | Path) -> ManifestSummary:
+    label_lengths = [len(record.label_text) for record in records]
+    unique_characters = sorted({char for record in records for char in record.label_text})
+    return ManifestSummary(
+        manifest_path=str(manifest_path),
+        num_samples=len(records),
+        unique_characters=unique_characters,
+        charset_size=len(unique_characters),
+        max_label_length=max(label_lengths),
+        min_label_length=min(label_lengths),
+        avg_label_length=sum(label_lengths) / len(label_lengths),
+    )
+
+
 class CRNNDataset(Dataset):
     """CRNN dataset for cropped CCPD plate images."""
 
@@ -176,9 +258,17 @@ class CRNNDataset(Dataset):
         img_height: int = 32,
         img_width: int = 160,
         grayscale: bool = True,
+        max_samples: Optional[int] = None,
+        sample_seed: int = 42,
     ) -> None:
         self.data_root = Path(data_root)
         self.records = load_manifest(data_root=self.data_root, manifest_path=manifest_path)
+        if max_samples is not None:
+            if max_samples <= 0:
+                raise ValueError("max_samples must be positive when provided.")
+            if max_samples < len(self.records):
+                random.Random(sample_seed).shuffle(self.records)
+                self.records = self.records[:max_samples]
         self.charset = charset
         self.img_height = img_height
         self.img_width = img_width
@@ -190,7 +280,7 @@ class CRNNDataset(Dataset):
 
     def __getitem__(self, index: int) -> Dict[str, object]:
         record = self.records[index]
-        image_tensor = self._load_image(record.image_path)
+        image_tensor, image_size = self._load_image(record.image_path)
         encoded_label = self.charset.encode(record.label_text)
         return {
             "image": image_tensor,
@@ -199,14 +289,17 @@ class CRNNDataset(Dataset):
             "text": record.label_text,
             "image_path": str(record.image_path),
             "image_rel_path": record.image_rel_path,
+            "encoded_label": encoded_label,
+            "original_size": image_size,
         }
 
-    def _load_image(self, image_path: Path) -> torch.Tensor:
+    def _load_image(self, image_path: Path) -> Tuple[torch.Tensor, Tuple[int, int]]:
         if not image_path.exists():
             raise FileNotFoundError(f"CRNN image file not found: {image_path}")
 
         image_mode = "L" if self.grayscale else "RGB"
         with Image.open(image_path) as image:
+            original_size = image.size
             image = image.convert(image_mode)
             image = image.resize((self.img_width, self.img_height), Image.BILINEAR)
             array = np.asarray(image, dtype=np.float32) / 255.0
@@ -215,7 +308,24 @@ class CRNNDataset(Dataset):
             array = np.expand_dims(array, axis=0)
         else:
             array = np.transpose(array, (2, 0, 1))
-        return torch.from_numpy(array)
+        return torch.from_numpy(array), original_size
+
+    def get_debug_records(self, count: int = 10) -> List[Dict[str, object]]:
+        debug_items: List[Dict[str, object]] = []
+        for record in self.records[:count]:
+            _, original_size = self._load_image(record.image_path)
+            encoded_label = self.charset.encode(record.label_text)
+            debug_items.append(
+                {
+                    "image_rel_path": record.image_rel_path,
+                    "image_path": str(record.image_path),
+                    "original_size": original_size,
+                    "resized_size": (self.img_width, self.img_height),
+                    "label_text": record.label_text,
+                    "encoded_label": encoded_label,
+                }
+            )
+        return debug_items
 
 
 def crnn_collate_fn(batch: Sequence[Dict[str, object]]) -> Dict[str, object]:
@@ -225,6 +335,8 @@ def crnn_collate_fn(batch: Sequence[Dict[str, object]]) -> Dict[str, object]:
     texts = [item["text"] for item in batch]  # type: ignore[index]
     image_paths = [item["image_path"] for item in batch]  # type: ignore[index]
     image_rel_paths = [item["image_rel_path"] for item in batch]  # type: ignore[index]
+    encoded_labels = [item["encoded_label"] for item in batch]  # type: ignore[index]
+    original_sizes = [item["original_size"] for item in batch]  # type: ignore[index]
 
     return {
         "images": images,
@@ -233,11 +345,13 @@ def crnn_collate_fn(batch: Sequence[Dict[str, object]]) -> Dict[str, object]:
         "texts": texts,
         "image_paths": image_paths,
         "image_rel_paths": image_rel_paths,
+        "encoded_labels": encoded_labels,
+        "original_sizes": original_sizes,
     }
 
 
 def decode_batch_predictions(logits: torch.Tensor, charset: CRNNCharset) -> List[str]:
-    """Decode CRNN logits from [T, N, C] to a list of strings."""
+    """Decode CRNN logits from [T, B, C] to a list of strings."""
 
     max_indices = logits.argmax(dim=2).transpose(0, 1).cpu().tolist()
     return [charset.decode_indices(indices) for indices in max_indices]
@@ -253,16 +367,23 @@ def compute_accuracy(predictions: Sequence[str], targets: Sequence[str]) -> Tupl
     for prediction, target in zip(predictions, targets):
         if prediction == target:
             correct_plates += 1
-        max_length = max(len(prediction), len(target))
-        if max_length == 0:
-            continue
-        total_chars += max_length
-        for index in range(max_length):
+
+        total_chars += len(target)
+        for index, target_char in enumerate(target):
             pred_char = prediction[index] if index < len(prediction) else None
-            target_char = target[index] if index < len(target) else None
             if pred_char == target_char:
                 correct_chars += 1
 
     char_accuracy = correct_chars / total_chars if total_chars else 0.0
     plate_accuracy = correct_plates / len(targets) if targets else 0.0
     return char_accuracy, plate_accuracy
+
+
+def save_debug_records(debug_records: Sequence[Dict[str, object]], output_path: str | Path) -> None:
+    path = Path(output_path)
+    path.write_text(json.dumps(list(debug_records), ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def save_manifest_summary(summary: ManifestSummary, output_path: str | Path) -> None:
+    path = Path(output_path)
+    path.write_text(json.dumps(asdict(summary), ensure_ascii=False, indent=2), encoding="utf-8")

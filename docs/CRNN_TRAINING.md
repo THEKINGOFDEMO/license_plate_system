@@ -9,7 +9,9 @@
 - CRNN 数据读取
 - 字符集说明
 - 模型结构说明
+- 诊断与调试
 - smoke test
+- overfit test
 - 正式训练
 - 验证
 - 预测
@@ -69,6 +71,42 @@ images/train/xxx.jpg    皖A12345
 
 CTC blank 不作为真实字符，内部索引固定为 `0`。
 
+当前实现会根据 `train/val` manifest 中真实出现的字符动态构建字符集，并在训练输出目录中保存：
+
+```text
+charset.json
+```
+
+该文件包含：
+
+- `blank_index`
+- `characters`
+- `char_to_index`
+- `index_to_char`
+
+## 诊断与调试
+
+为便于定位 CTC 链路问题，训练脚本会额外输出并保存：
+
+- `charset.json`
+- `train_manifest_summary.json`
+- `val_manifest_summary.json`
+- `dataset_debug_samples.json`
+- `history.json`
+- `history.csv`
+
+训练开始前还会打印：
+
+- 字符集大小
+- 字符集字符列表
+- 最大标签长度、最小标签长度、平均标签长度
+- 10 条训练样本的图片路径、原始尺寸、resize 后尺寸、label、encoded label
+- `皖A12345` 的编码/解码回环结果
+
+如果提供 `test.txt`，脚本也会把 test 集纳入字符集覆盖检查，并额外保存：
+
+- `test_manifest_summary.json`
+
 ## 模型结构
 
 当前实现使用标准 CRNN 思路：
@@ -125,6 +163,28 @@ bash train/run_crnn_smoke.sh
 
 ```text
 /cloud/cloud-ssd1/runs/crnn/ccpd10000_crnn_smoke
+```
+
+## overfit test 命令
+
+在正式重训前，建议优先运行 overfit test：
+
+```bash
+cd /cloud/cloud-ssd1/projects/license_plate_system
+bash train/run_crnn_overfit.sh
+```
+
+该脚本会：
+
+- 只取 `64` 张训练图片；
+- 同时用这 `64` 张图片做 train/val；
+- 训练 `150` epochs；
+- 验证模型能否在极小样本上明显过拟合。
+
+输出目录：
+
+```text
+/cloud/cloud-ssd1/runs/crnn/ccpd10000_crnn_overfit
 ```
 
 ## 正式训练命令
@@ -194,6 +254,12 @@ smoke test 输出目录：
 /cloud/cloud-ssd1/runs/crnn/ccpd10000_crnn_smoke
 ```
 
+overfit test 输出目录：
+
+```text
+/cloud/cloud-ssd1/runs/crnn/ccpd10000_crnn_overfit
+```
+
 正式训练输出目录：
 
 ```text
@@ -204,7 +270,12 @@ smoke test 输出目录：
 
 - `best.pth`
 - `last.pth`
+- `charset.json`
+- `train_manifest_summary.json`
+- `val_manifest_summary.json`
+- `dataset_debug_samples.json`
 - `history.json`
+- `history.csv`
 
 ## 论文中需要保存哪些结果
 
@@ -212,8 +283,10 @@ smoke test 输出目录：
 
 - `best.pth`
 - `last.pth`
+- `charset.json`
 - 训练日志
 - `history.json`
+- `history.csv`
 - 验证阶段输出的字符准确率
 - 验证阶段输出的整牌准确率
 - 若干真实标签与预测结果样例
@@ -232,11 +305,13 @@ smoke test 输出目录：
 建议在 AutoDL 上按下面顺序执行：
 
 1. 安装依赖
-2. 运行 `bash train/run_crnn_smoke.sh`
-3. 确认 smoke test 输出正常
-4. 运行 `bash train/run_crnn_train.sh`
-5. 运行 `bash train/run_crnn_eval.sh`
-6. 运行 `bash train/run_crnn_predict.sh`
+2. 运行 `bash train/run_crnn_overfit.sh`
+3. 确认 overfit test 能明显学住小样本
+4. 运行 `bash train/run_crnn_smoke.sh`
+5. 确认 smoke test 输出正常
+6. 运行 `bash train/run_crnn_train.sh`
+7. 运行 `bash train/run_crnn_eval.sh`
+8. 运行 `bash train/run_crnn_predict.sh`
 
 ## 当前结论
 
