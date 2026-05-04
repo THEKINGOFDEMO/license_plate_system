@@ -187,6 +187,29 @@ bash train/run_crnn_overfit.sh
 /cloud/cloud-ssd1/runs/crnn/ccpd10000_crnn_overfit
 ```
 
+## tiny overfit test 命令
+
+如果需要更强的链路验证，优先运行 tiny overfit：
+
+```bash
+cd /cloud/cloud-ssd1/projects/license_plate_system
+bash train/run_crnn_overfit_tiny.sh
+```
+
+该脚本会：
+
+- 只取 `8` 张训练图片；
+- 同时用这 `8` 张图片做 train/val；
+- 训练 `300` epochs；
+- 每隔若干 epoch 输出这 8 张样本的 `gt/pred`；
+- 明确输出 `train_char_acc` 和 `train_plate_acc`。
+
+输出目录：
+
+```text
+/cloud/cloud-ssd1/runs/crnn/ccpd10000_crnn_overfit_tiny
+```
+
 ## 正式训练命令
 
 正式训练脚本默认配置：
@@ -260,6 +283,12 @@ overfit test 输出目录：
 /cloud/cloud-ssd1/runs/crnn/ccpd10000_crnn_overfit
 ```
 
+tiny overfit 输出目录：
+
+```text
+/cloud/cloud-ssd1/runs/crnn/ccpd10000_crnn_overfit_tiny
+```
+
 正式训练输出目录：
 
 ```text
@@ -305,13 +334,15 @@ overfit test 输出目录：
 建议在 AutoDL 上按下面顺序执行：
 
 1. 安装依赖
-2. 运行 `bash train/run_crnn_overfit.sh`
-3. 确认 overfit test 能明显学住小样本
-4. 运行 `bash train/run_crnn_smoke.sh`
-5. 确认 smoke test 输出正常
-6. 运行 `bash train/run_crnn_train.sh`
-7. 运行 `bash train/run_crnn_eval.sh`
-8. 运行 `bash train/run_crnn_predict.sh`
+2. 运行 `bash train/run_crnn_overfit_tiny.sh`
+3. 确认 tiny overfit 能明显学住 8 张样本
+4. 再运行 `bash train/run_crnn_overfit.sh`
+5. 确认 64 张 overfit 也能明显提升 `train_plate_acc`
+6. 运行 `bash train/run_crnn_smoke.sh`
+7. 确认 smoke test 输出正常
+8. 运行 `bash train/run_crnn_train.sh`
+9. 运行 `bash train/run_crnn_eval.sh`
+10. 运行 `bash train/run_crnn_predict.sh`
 
 ## 当前结论
 

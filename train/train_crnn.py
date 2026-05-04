@@ -6,7 +6,7 @@ import argparse
 import csv
 import json
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 from PIL import Image
@@ -73,6 +73,23 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help="Number of resized debug images to save under output-dir/debug_samples.",
     )
+    parser.add_argument(
+        "--eval-train-subset",
+        action="store_true",
+        help="Evaluate train_char_acc and train_plate_acc on the training subset after each epoch.",
+    )
+    parser.add_argument(
+        "--sample-pred-count",
+        type=int,
+        default=10,
+        help="Number of gt/pred examples to print during evaluation logs.",
+    )
+    parser.add_argument(
+        "--sample-pred-interval",
+        type=int,
+        default=1,
+        help="Print gt/pred examples every N epochs.",
+    )
     parser.add_argument("--resume", default=None, help="Optional checkpoint path used to resume training.")
     return parser
 
@@ -134,6 +151,10 @@ def main() -> int:
         save_manifest_summary(test_summary, output_dir / "test_manifest_summary.json")
 
     print_charset_debug_info(charset=charset, train_summary=train_summary, val_summary=val_summary, test_summary=test_summary)
+    max_label_length = max(
+        summary.max_label_length
+        for summary in [train_summary, val_summary] + ([test_summary] if test_summary is not None else [])
+    )
 
     debug_records = train_dataset.get_debug_records(count=args.debug_sample_count)
     save_debug_records(debug_records, output_dir / "dataset_debug_samples.json")
@@ -146,6 +167,13 @@ def main() -> int:
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
+        num_workers=args.workers,
+        collate_fn=crnn_collate_fn,
+    )
+    train_eval_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
         num_workers=args.workers,
         collate_fn=crnn_collate_fn,
     )
@@ -165,6 +193,7 @@ def main() -> int:
     ).to(device)
     criterion = nn.CTCLoss(blank=charset.blank_index, zero_infinity=True)
     optimizer = Adam(model.parameters(), lr=args.lr)
+    logger = build_logger(output_dir / "train.log")
 
     history: List[Dict[str, float]] = []
     best_plate_accuracy = -1.0
@@ -177,35 +206,76 @@ def main() -> int:
         history = checkpoint.get("history", [])
         best_plate_accuracy = max((float(item["plate_accuracy"]) for item in history), default=-1.0)
         start_epoch = int(checkpoint["epoch"]) + 1
-        print(f"[train_crnn] Resumed from checkpoint: {args.resume} at epoch {start_epoch}")
+        logger(f"[train_crnn] Resumed from checkpoint: {args.resume} at epoch {start_epoch}")
 
+    log_path = output_dir / "train.log"
+    if start_epoch == 1 and log_path.exists():
+        log_path.unlink()
     history_csv_path = output_dir / "history.csv"
     if not history_csv_path.exists() or start_epoch == 1:
-        history_csv_path.write_text("epoch,train_loss,val_loss,char_accuracy,plate_accuracy,learning_rate\n", encoding="utf-8")
+        history_csv_path.write_text(
+            "epoch,train_loss,val_loss,train_char_accuracy,train_plate_accuracy,char_accuracy,plate_accuracy,learning_rate\n",
+            encoding="utf-8",
+        )
 
-    print(f"[train_crnn] Model output time steps T={model.output_time_steps}")
+    debug_shapes = collect_debug_shapes(
+        model=model,
+        data_loader=train_eval_loader,
+        device=device,
+        charset=charset,
+        max_label_length=max_label_length,
+    )
+    save_debug_shapes(debug_shapes, output_dir / "debug_shapes.json")
+    print_debug_shapes(logger, charset, max_label_length, model, debug_shapes)
 
     for epoch in range(start_epoch, args.epochs + 1):
         train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
-        val_loss, char_acc, plate_acc, samples = evaluate(model, val_loader, criterion, device, charset)
+        train_char_acc = 0.0
+        train_plate_acc = 0.0
+        train_samples: List[Tuple[str, str, str]] = []
+        if args.eval_train_subset:
+            _, train_char_acc, train_plate_acc, train_samples = evaluate(
+                model,
+                train_eval_loader,
+                criterion,
+                device,
+                charset,
+                sample_limit=args.sample_pred_count,
+            )
+
+        val_loss, char_acc, plate_acc, samples = evaluate(
+            model,
+            val_loader,
+            criterion,
+            device,
+            charset,
+            sample_limit=args.sample_pred_count,
+        )
         learning_rate = float(optimizer.param_groups[0]["lr"])
 
         epoch_record = {
             "epoch": float(epoch),
             "train_loss": float(train_loss),
             "val_loss": float(val_loss),
+            "train_char_accuracy": float(train_char_acc),
+            "train_plate_accuracy": float(train_plate_acc),
             "char_accuracy": float(char_acc),
             "plate_accuracy": float(plate_acc),
             "learning_rate": learning_rate,
         }
         history.append(epoch_record)
 
-        print(
+        logger(
             f"[train_crnn] epoch={epoch} "
             f"train_loss={train_loss:.4f} val_loss={val_loss:.4f} "
+            f"train_char_acc={train_char_acc:.4f} train_plate_acc={train_plate_acc:.4f} "
             f"char_acc={char_acc:.4f} plate_acc={plate_acc:.4f} lr={learning_rate:.6f}"
         )
-        print_sample_predictions(samples)
+        should_print_samples = (epoch % max(args.sample_pred_interval, 1) == 0) or epoch == 1 or epoch == args.epochs
+        if should_print_samples:
+            if args.eval_train_subset and train_samples:
+                print_sample_predictions(logger, "train", train_samples)
+            print_sample_predictions(logger, "val", samples)
 
         checkpoint = {
             "epoch": epoch,
@@ -230,8 +300,8 @@ def main() -> int:
             encoding="utf-8",
         )
 
-    print(f"[train_crnn] Best plate accuracy: {best_plate_accuracy:.4f}")
-    print(f"[train_crnn] Outputs saved to: {output_dir}")
+    logger(f"[train_crnn] Best plate accuracy: {best_plate_accuracy:.4f}")
+    logger(f"[train_crnn] Outputs saved to: {output_dir}")
     return 0
 
 
@@ -284,6 +354,7 @@ def evaluate(
     criterion: nn.CTCLoss,
     device: torch.device,
     charset: CRNNCharset,
+    sample_limit: int,
 ) -> Tuple[float, float, float, List[Tuple[str, str, str]]]:
     model.eval()
     total_loss = 0.0
@@ -324,7 +395,7 @@ def evaluate(
         all_targets.extend(texts)
 
         for rel_path, target_text, pred_text in zip(image_rel_paths, texts, predictions):
-            if len(sample_outputs) < 10:
+            if len(sample_outputs) < sample_limit:
                 sample_outputs.append((str(rel_path), str(target_text), str(pred_text)))
 
     char_acc, plate_acc = compute_accuracy(all_predictions, all_targets)
@@ -408,6 +479,8 @@ def append_history_csv(history_csv_path: Path, epoch_record: Dict[str, float]) -
                 int(epoch_record["epoch"]),
                 f"{epoch_record['train_loss']:.6f}",
                 f"{epoch_record['val_loss']:.6f}",
+                f"{epoch_record['train_char_accuracy']:.6f}",
+                f"{epoch_record['train_plate_accuracy']:.6f}",
                 f"{epoch_record['char_accuracy']:.6f}",
                 f"{epoch_record['plate_accuracy']:.6f}",
                 f"{epoch_record['learning_rate']:.8f}",
@@ -415,12 +488,88 @@ def append_history_csv(history_csv_path: Path, epoch_record: Dict[str, float]) -
         )
 
 
-def print_sample_predictions(samples: List[Tuple[str, str, str]]) -> None:
+def print_sample_predictions(logger, tag: str, samples: List[Tuple[str, str, str]]) -> None:
     if not samples:
         return
-    print("[train_crnn] Sample predictions:")
+    logger(f"[train_crnn] Sample predictions ({tag}):")
     for rel_path, target_text, pred_text in samples:
-        print(f"  - {rel_path}: gt={target_text} pred={pred_text}")
+        logger(f"  - {rel_path}: gt={target_text} pred={pred_text}")
+
+
+def collect_debug_shapes(
+    model: CRNN,
+    data_loader: DataLoader,
+    device: torch.device,
+    charset: CRNNCharset,
+    max_label_length: int,
+) -> Dict[str, object]:
+    first_batch = next(iter(data_loader))
+    images = first_batch["images"].to(device)
+    target_lengths = first_batch["target_lengths"]
+    with torch.no_grad():
+        logits = model(images)
+
+    image_tensor_shape = list(images.shape)
+    model_output_shape = list(logits.shape)
+    time_steps = int(logits.size(0))
+    output_classes = int(logits.size(2))
+    input_lengths = [time_steps for _ in range(images.size(0))]
+    min_target_length = int(target_lengths.min().item())
+    max_target_length = int(target_lengths.max().item())
+    min_input_length = min(input_lengths)
+
+    if time_steps < max_label_length:
+        raise RuntimeError(
+            f"CRNN output time steps T={time_steps} is smaller than max_label_length={max_label_length}. "
+            "The model cannot satisfy CTC alignment with the current architecture."
+        )
+    if time_steps < 20:
+        raise RuntimeError(
+            f"CRNN output time steps T={time_steps} is too short for robust CCPD recognition. "
+            "Expected T >= 20 with input width 160."
+        )
+    if output_classes != charset.num_classes:
+        raise RuntimeError(
+            f"CRNN output classes C={output_classes} does not match charset.num_classes={charset.num_classes}."
+        )
+
+    return {
+        "image_tensor_shape": image_tensor_shape,
+        "model_output_shape": model_output_shape,
+        "T": time_steps,
+        "num_classes": output_classes,
+        "max_label_length": int(max_label_length),
+        "min_target_length": min_target_length,
+        "max_target_length": max_target_length,
+        "sample_input_lengths": input_lengths[: min(10, len(input_lengths))],
+        "sample_target_lengths": target_lengths[: min(10, target_lengths.numel())].tolist(),
+        "blank_index": charset.blank_index,
+        "charset_size": len(charset.characters),
+        "whether min_input_length >= max_target_length": bool(min_input_length >= max_target_length),
+    }
+
+
+def save_debug_shapes(debug_shapes: Dict[str, object], output_path: Path) -> None:
+    output_path.write_text(json.dumps(debug_shapes, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def print_debug_shapes(logger, charset: CRNNCharset, max_label_length: int, model: CRNN, debug_shapes: Dict[str, object]) -> None:
+    logger(f"[train_crnn] Charset size: {len(charset.characters)}")
+    logger(f"[train_crnn] Max label length: {max_label_length}")
+    logger(f"[train_crnn] Model output time steps T: {model.output_time_steps}")
+    logger(f"[train_crnn] Output classes C: {debug_shapes['num_classes']}")
+    logger(f"[train_crnn] input_lengths sample: {debug_shapes['sample_input_lengths']}")
+    logger(f"[train_crnn] target_lengths sample: {debug_shapes['sample_target_lengths']}")
+    logger(f"[train_crnn] Label roundtrip OK")
+
+
+def build_logger(log_path: Path):
+    def _log(message: str) -> None:
+        print(message)
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(message + "\n")
+
+    return _log
 
 
 if __name__ == "__main__":
