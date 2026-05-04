@@ -173,9 +173,7 @@ class CRNNCharset:
 def load_manifest(data_root: str | Path, manifest_path: str | Path) -> List[SampleRecord]:
     root = Path(data_root)
     manifest = Path(manifest_path)
-    if not manifest.is_absolute():
-        manifest = root / manifest
-    manifest = manifest.resolve()
+    manifest = resolve_manifest_path(data_root=root, manifest_path=manifest)
 
     if not manifest.exists():
         raise FileNotFoundError(f"CRNN manifest file not found: {manifest}")
@@ -204,6 +202,21 @@ def load_manifest(data_root: str | Path, manifest_path: str | Path) -> List[Samp
     if not records:
         raise ValueError(f"No valid samples found in manifest: {manifest}")
     return records
+
+
+def resolve_manifest_path(data_root: str | Path, manifest_path: str | Path) -> Path:
+    root = Path(data_root)
+    manifest = Path(manifest_path)
+
+    if manifest.is_absolute():
+        return manifest.resolve()
+
+    # If the caller already passed a relative path that exists as-is from the
+    # current working directory, use it directly instead of re-prefixing data_root.
+    if manifest.exists():
+        return manifest.resolve()
+
+    return (root / manifest).resolve()
 
 
 def build_charset_from_records(records: Sequence[SampleRecord], fallback_charset: Optional[Sequence[str]] = None) -> CRNNCharset:

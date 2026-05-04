@@ -57,7 +57,7 @@ class CRNNCharsetTestCase(unittest.TestCase):
 
             charset = build_charset_from_manifests(
                 data_root=temp_dir,
-                manifest_paths=[manifest],
+                manifest_paths=["train.txt"],
             )
             mapping = charset.to_json_dict()
         finally:
