@@ -7,6 +7,7 @@ import csv
 import json
 import sys
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
 
@@ -34,6 +35,7 @@ DEFAULT_CHARSET = "/cloud/cloud-ssd1/models/crnn/charset.json"
 DEFAULT_SOURCE = "/cloud/cloud-ssd1/lpr_data/ccpd_10000/images/test"
 DEFAULT_OUTPUT_DIR = "/cloud/cloud-ssd1/runs/pipeline/ccpd10000_yolo_crnn_predict"
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+ANNOTATION_FONT_SIZE = 22
 
 
 @dataclass
@@ -456,23 +458,36 @@ def add_status_banner(image: np.ndarray, text: str) -> None:
 
 
 def draw_unicode_label(image_bgr: np.ndarray, label: str, x: int, y: int) -> None:
-    font = load_annotation_font()
+    font = load_annotation_font(size=ANNOTATION_FONT_SIZE)
     image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
     canvas = Image.fromarray(image_rgb)
     draw = ImageDraw.Draw(canvas)
     text_bbox = draw.textbbox((0, 0), label, font=font)
     text_width = int(text_bbox[2] - text_bbox[0])
     text_height = int(text_bbox[3] - text_bbox[1])
-    label_y = max(0, y - text_height - 8)
-    label_x2 = min(canvas.width, x + text_width + 10)
-    label_y2 = min(canvas.height, label_y + text_height + 8)
-    draw.rectangle([(x, label_y), (label_x2, label_y2)], fill=(0, 120, 0))
-    draw.text((x + 5, label_y + 3), label, font=font, fill=(255, 255, 255))
+    padding_x = 8
+    padding_y = 6
+    label_width = text_width + padding_x * 2
+    label_height = text_height + padding_y * 2
+
+    label_x = min(max(0, x), max(0, canvas.width - label_width))
+    preferred_top = y - label_height - 6
+    label_y = preferred_top if preferred_top >= 0 else min(canvas.height - label_height, y + 6)
+    label_y = max(0, label_y)
+    label_x2 = min(canvas.width, label_x + label_width)
+    label_y2 = min(canvas.height, label_y + label_height)
+
+    draw.rectangle([(label_x, label_y), (label_x2, label_y2)], fill=(0, 120, 0))
+    draw.text((label_x + padding_x, label_y + padding_y - 1), label, font=font, fill=(255, 255, 255))
     image_bgr[:, :, :] = cv2.cvtColor(np.asarray(canvas), cv2.COLOR_RGB2BGR)
 
 
-def load_annotation_font() -> ImageFont.ImageFont:
+@lru_cache(maxsize=4)
+def load_annotation_font(size: int = ANNOTATION_FONT_SIZE) -> ImageFont.ImageFont:
     font_candidates = [
+        "C:/Windows/Fonts/msyh.ttc",
+        "C:/Windows/Fonts/simhei.ttf",
+        "C:/Windows/Fonts/simsun.ttc",
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
         "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
@@ -482,9 +497,14 @@ def load_annotation_font() -> ImageFont.ImageFont:
         path = Path(font_path)
         if path.exists():
             try:
-                return ImageFont.truetype(str(path), size=20)
+                print(f"[pipeline] Using annotation font: {path}")
+                return ImageFont.truetype(str(path), size=size)
             except OSError:
                 continue
+    print(
+        "[pipeline] WARNING: No preferred Chinese font was found. "
+        "Annotated images will still be generated, but Chinese label rendering may be incomplete."
+    )
     return ImageFont.load_default()
 
 
